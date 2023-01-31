@@ -1,0 +1,215 @@
+package controllers
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net/http"
+	"restaurantms/database"
+	"restaurantms/models"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+)
+
+type invoiceViewFormat struct {
+	Invoice_Id       string
+	Payment_method   string
+	Order_id         string
+	Payment_status   *string
+	Payment_due      interface{}
+	Table_number     interface{}
+	Payment_due_date time.Time
+	Order_details    interface{}
+}
+
+// Initializing the database instance for invoices
+var invoiceCollections *mongo.Collection = database.OpenCollection(database.Client, "Invoice")
+
+// GetInvoice(), will get the details for all the records present in the database
+func GetInvoice() gin.HandlerFunc {
+	return func(c *gin.Context) {
+
+		var ctx, cancel = context.WithTimeout(context.Background(), 100*time.Second)
+
+		//initiating search
+		res, err := invoiceCollections.Find(context.TODO(), bson.M{})
+
+		defer cancel()
+		// handling error
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"Error": "Error retrieving invoice"})
+			return
+		}
+
+		// variable for returning all the records
+		var allInvoice []bson.M
+		if err = res.All(ctx, &allInvoice); err != nil {
+			log.Fatal(err)
+		}
+		c.JSON(http.StatusOK, allInvoice)
+	}
+}
+
+// GetInvoicebyID(), will get the details for a specified record present in the database
+func GetInvoicebyID() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var ctx, cancel = context.WithTimeout(context.Background(), 100*time.Second)
+
+		var invoice models.Invoice
+
+		// Getting id off the request body
+		invoiceId := c.Param("invoice_id")
+
+		// initiating search
+		err := invoiceCollections.FindOne(ctx, bson.M{"invoice_id": invoiceId}).Decode(&invoice)
+
+		defer cancel()
+
+		// handling error
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"Error": "Failed retrieving invoice items"})
+			return
+		}
+
+		// initialize invoice custom view
+		var invoiceView invoiceViewFormat
+		allOrderItems, err := ItemsByOrder(invoice.Order_id)
+		if err != nil {
+			panic(err)
+		}
+
+		invoiceView.Order_id = invoice.Order_id
+		invoiceView.Payment_due_date = invoice.Payment_due_date
+
+		invoiceView.Payment_method = "null"
+		if invoice.Payment_method != nil {
+			invoiceView.Payment_method = *invoice.Payment_method
+		}
+
+		invoiceView.Invoice_Id = invoice.Invoice_id
+		invoiceView.Payment_status = *&invoice.Payment_status
+		invoiceView.Payment_due = allOrderItems[0]["payment_due"]
+		invoiceView.Table_number = allOrderItems[0]["table_number"]
+		invoiceView.Order_details = allOrderItems[0]["order_details"]
+
+		c.JSON(http.StatusOK, invoiceView)
+	}
+}
+
+func CreateInvoice() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var ctx, cancel = context.WithTimeout(context.Background(), 100*time.Second)
+
+		// initializing the models for insertion
+		var invoice models.Invoice
+
+		// binding JSON to the body
+		err := c.BindJSON(&invoice)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"Error": err.Error()})
+			return
+		}
+
+		var order models.Order
+
+		err = orderCollection.FindOne(ctx, bson.M{"order_id": invoice.Order_id}).Decode(&order)
+
+		defer cancel()
+
+		if err != nil {
+			msg := fmt.Sprintf("Not found")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": msg})
+		}
+
+		status := "PENDING"
+		if invoice.Payment_status == nil {
+			invoice.Payment_status = &status
+		}
+
+		invoice.Payment_due_date, _ = time.Parse(time.RFC3339, time.Now().AddDate(0, 0, 1).Format(time.RFC3339))
+		invoice.Created_at, _ = time.Parse(time.RFC3339, time.Now().Format(time.RFC3339))
+		invoice.Updated_at, _ = time.Parse(time.RFC3339, time.Now().Format(time.RFC3339))
+
+		invoice.ID = primitive.NewObjectID()
+		invoice.Invoice_id = invoice.ID.Hex()
+		// validating structure before inserting
+		validationErr := validate.Struct(invoice)
+		if validationErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": validationErr.Error()})
+		}
+
+		res, insertErr := invoiceCollections.InsertOne(ctx, invoice)
+		if insertErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error while creating new invoice"})
+		}
+
+		defer cancel()
+
+		c.JSON(http.StatusOK, res)
+
+	}
+}
+
+func UpdateInvoice() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var ctx, cancel = context.WithTimeout(context.Background(), 100*time.Second)
+
+		defer cancel()
+
+		var invoice models.Invoice
+
+		invoiceId := c.Param("invoice_id")
+
+		err := c.BindJSON(&invoice)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"Error": err.Error()})
+			return
+		}
+
+		filter := bson.M{"invoice_id": invoiceId}
+
+		var updateObj primitive.D
+
+		if invoice.Payment_method != nil {
+			updateObj = append(updateObj, bson.E{"payment_method", invoice.Payment_method})
+		}
+
+		if invoice.Payment_status != nil {
+			updateObj = append(updateObj, bson.E{"payment_status", invoice.Payment_status})
+		}
+
+		invoice.Updated_at, _ = time.Parse(time.RFC3339, time.Now().Format(time.RFC3339))
+		updateObj = append(updateObj, bson.E{"updated_at", invoice.Updated_at})
+
+		upsert := true
+
+		opts := options.UpdateOptions{
+			Upsert: &upsert,
+		}
+
+		status := "PENDING"
+
+		if invoice.Payment_status == nil {
+			invoice.Payment_status = &status
+		}
+
+		res, err := invoiceCollections.UpdateOne(ctx,
+			filter,
+			bson.D{
+				{"$set", updateObj},
+			},
+			&opts,
+		)
+
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Invoie updation failed"})
+			return
+		}
+		c.JSON(http.StatusOK, res)
+	}
+}
