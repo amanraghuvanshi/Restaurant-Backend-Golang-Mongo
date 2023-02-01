@@ -13,3 +13,6 @@ Composition:
 > Integration
 > Middleware
 > JWT Authentication
+
+
+Create a .env file with your desired enviroment variables with PORT number and CONNECTION URI
